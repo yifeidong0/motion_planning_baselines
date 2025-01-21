@@ -186,7 +186,7 @@ class CostCollision(Cost):
             obst_costs = w_mat * err_obst.sum(1)
             costs = obst_costs
 
-        return costs
+        return costs # (n_samples,)
 
     def get_linear_system(self, trajs, q_pos=None, q_vel=None, H_positions=None,
                           trajs_interp=None, q_pos_interp=None, q_vel_interp=None, H_positions_interp=None,
@@ -320,11 +320,12 @@ class CostGPTrajectory(Cost):
             self,
             robot,
             n_support_points,
-            dt,
+            dt, # 0.078125
             sigma_gp=None,
             **kwargs
     ):
         super().__init__(robot, n_support_points, **kwargs)
+
         self.dt = dt
 
         self.sigma_gp = sigma_gp
@@ -342,7 +343,10 @@ class CostGPTrajectory(Cost):
         )
 
     def eval(self, trajs, **observation):
+        """trajs: (n_samples, n_support_points, dim), such as (50,64,4)"""
+
         # trajs = trajs.reshape(-1, self.n_support_points, self.dim)
+        # print("@@@@@@@2trajs.shape", trajs[0,10:15,:])
 
         # GP cost
         err_gp = self.gp_prior.get_error(trajs, calc_jacobian=False)
@@ -355,6 +359,71 @@ class CostGPTrajectory(Cost):
 
     def get_linear_system(self, trajs, **observation):
         pass
+
+
+class CostPotentialEnergy(Cost):
+    def __init__(self, robot, n_support_points, **kwargs):
+        """
+        n_support_points: number of way-points in the trajectory
+        n_dof: number of degrees of freedom of the robot (2 for 2D)
+        """
+        super().__init__(robot, n_support_points, **kwargs)
+        self.set_cost_factors()
+
+    def set_cost_factors(self):
+        # No specific cost factors needed for this cost function
+        pass
+
+    def eval(self, trajs, penalize_max_potential=1, num_penalty_group=5, weights_penalty=[0.1,0.2,0.4,0.2,0.1], **observation,):
+        """
+        Evaluate the cost function that minimizes the maximum potential increase along the trajectory.
+        The potential energy is computed based on the y-position (pos1).
+        The derivative of the potential energy is computed using finite differences (torch.autograd in class GuideManagerTrajectories).
+        Input:
+            trajs: tensor of shape (n_samples, n_support_points, dim)
+        """
+        # Extract y-position for all samples and support points
+        pos1 = trajs[:, :, 1]  # Shape: (n_samples, n_support_points)
+
+        if penalize_max_potential:
+            # Compute the max pos1 and the index of the max pos1 for each trajectory
+            max_pos1, idx_max = torch.max(pos1, dim=1)  # Get the max pos1 for each trajectory (shape: (n_samples,))
+            
+            # Compute the penalty group index (shape: (n_samples, num_penalty_group))
+            # Clipping indices to ensure valid range (0 to n_support_points-1)
+            penalty_group_idx = torch.stack([
+                torch.clamp(idx_max - 2, min=0), 
+                torch.clamp(idx_max - 1, min=0), 
+                idx_max, 
+                torch.clamp(idx_max + 1, max=pos1.size(1) - 1), 
+                torch.clamp(idx_max + 2, max=pos1.size(1) - 1)
+            ], dim=1)
+
+            # Compute the cost using weights and the penalty group indices
+            # cost = torch.sum(weights_penalty[0] * pos1.gather(1, penalty_group_idx[:, 0].unsqueeze(1)), dim=1) + \
+            #        torch.sum(weights_penalty[1] * pos1.gather(1, penalty_group_idx[:, 1].unsqueeze(1)), dim=1) + \
+            #        torch.sum(weights_penalty[2] * pos1.gather(1, penalty_group_idx[:, 2].unsqueeze(1)), dim=1) + \
+            #        torch.sum(weights_penalty[3] * pos1.gather(1, penalty_group_idx[:, 3].unsqueeze(1)), dim=1) + \
+            #        torch.sum(weights_penalty[4] * pos1.gather(1, penalty_group_idx[:, 4].unsqueeze(1)), dim=1)
+            cost = torch.sum(sum(weights_penalty[i] * pos1.gather(1, penalty_group_idx[:, i].unsqueeze(1)) for i in range(num_penalty_group)), dim=1)
+
+        else: # penalize piecewise potential increase (not working well)
+            # Compute the cost for each trajectory
+            # potential_increase = pos1[:, 1:] - pos1[:, :-1]  # Shape: (n_samples, n_support_points - 1)
+            # potential_increase = torch.clamp(potential_increase, min=0)  # Only penalize increases
+            # cost = torch.sum(potential_increase, dim=1)
+
+            # Penalize the y-axis velocity
+            cost = torch.sum(torch.clamp(trajs[:, :, 3], min=0), dim=1)
+
+        return cost
+
+    def get_linear_system(self, trajs, q_pos=None, q_vel=None, H_positions=None, **observation):
+        """
+        Since we are not using a complex linear system here, we just return None.
+        The gradient is computed directly in eval().
+        """
+        return None, None, None
 
 
 class CostGPTrajectoryPositionOnlyWrapper(CostGPTrajectory):
